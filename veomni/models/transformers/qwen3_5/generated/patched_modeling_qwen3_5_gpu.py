@@ -86,6 +86,8 @@ except ImportError:
         "This case can't support dynamic batching packing!"
     )
 
+from .chunk_gated_delta_rule import chunk_gated_delta_rule
+from .convolution import causal_conv1d as causal_conv1d_fn
 
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
@@ -656,14 +658,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 else:
                     conv_weight = self.conv1d.weight.squeeze(1)
                 # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
+                # mixed_qkv = self.causal_conv1d_fn(
+                #     x=mixed_qkv,
+                #     weight=conv_weight,
+                #     bias=self.conv1d.bias,
+                #     activation=self.activation,
+                #     seq_idx=None,
+                #     backend="triton",
+                #     cu_seqlens=cu_seq_lens_q,
+                # )[0]
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
                     weight=conv_weight,
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                    seq_idx=None,
-                    backend="triton",
-                    cu_seqlens=cu_seq_lens_q,
+                    cu_seqlens=cu_seq_lens_q.npu()
                 )[0]
             else:
                 raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
@@ -713,7 +722,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     initial_state=None,
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=cu_seq_lens_q,
+                    cu_seqlens=cu_seq_lens_q.npu(),
                 )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
@@ -946,9 +955,25 @@ class Qwen3_5MLP(nn.Module):
 # Source: liger_kernel.transformers.rms_norm
 # ======================================================================
 # Import from: liger_kernel.transformers.rms_norm.LigerRMSNormForQwen3Next
-from liger_kernel.transformers.rms_norm import LigerRMSNormForQwen3Next as Qwen3_5RMSNorm
+# from liger_kernel.transformers.rms_norm import LigerRMSNormForQwen3Next as Qwen3_5RMSNorm
+class Qwen3_5RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
 
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    def forward(self, x):
+        output = self._norm(x.float())
+        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5DecoderLayer
 # Methods patched: forward
@@ -2013,7 +2038,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         # --- Patch.4: Restore pre-computed Flash Attention kwargs for language model ---
         kwargs.update(flash_attn_kwargs)
         # --- Patch.4 ---
-
+        print("[zrw]",inputs_embeds.shape)
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
